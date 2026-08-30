@@ -8,13 +8,17 @@ Chains the four stages and writes everything under Output_<input folder name>:
 
     Mechanical_input\                              (your images)
     Output_Mechanical_input\
-        output_text_Mechanical_input\   *_text.md    <- ocr_to_md.py    (GPU)
+        output_text_Mechanical_input\   *_text.md    <- ocr_to_md.py (GPU) or vlm_to_md.py (API)
         output_table_Mechanical_input\  *_table.md   <- md_to_table.py  (Claude CLI)
         output_csv_Mechanical_input\    <name>.csv   <- tables_to_csv.py
         output_excel_Mechanical_input\  <name>.xlsx  <- csv_to_excel.py
 
 The stages run in sequence, not in parallel: each one consumes the previous
-stage's output. Only --model affects the Claude step; the OCR step is local.
+stage's output. Only --model affects the Claude step. The OCR step is local
+by default; --ocr-backend api sends the images to a cloud vision model
+instead (vlm_to_md.py -- see --provider / --ocr-model / --base-url):
+
+    python run_pipeline.py --image_dir Mechanical_input --ocr-backend api --provider anthropic
 """
 
 import argparse
@@ -86,9 +90,33 @@ def main():
     ap.add_argument("--list-models", action="store_true",
                     help="print the model list and exit")
     ap.add_argument("--mode", choices=["gundam", "base"], default="gundam",
-                    help="OCR mode (default: gundam)")
+                    help="OCR mode (default: gundam; local backend only)")
     ap.add_argument("--raw", action="store_true",
-                    help="keep <|det|> layout markers in the OCR text")
+                    help="keep <|det|> layout markers in the OCR text "
+                         "(local backend only)")
+    ap.add_argument("--ocr-backend", choices=["local", "api"], default="local",
+                    help="how to read the images: 'local' runs the GPU OCR "
+                         "model (ocr_to_md.py), 'api' calls a cloud vision "
+                         "model (vlm_to_md.py) (default: local)")
+    ap.add_argument("--provider", choices=["openai", "anthropic", "gemini",
+                                           "custom"], default=None,
+                    help="API preset for --ocr-backend api "
+                         "(default: VLM_PROVIDER from .env, else openai)")
+    ap.add_argument("--base-url", default=None,
+                    help="API base URL override (required with --provider custom)")
+    ap.add_argument("--ocr-model", default=None,
+                    help="vision model for --ocr-backend api "
+                         "(default: the provider's preset)")
+    ap.add_argument("--api-key-env", default=None,
+                    help="env var holding the API key "
+                         "(default: the provider's usual variable)")
+    ap.add_argument("--ocr-concurrency", type=int, default=1,
+                    help="parallel API requests for --ocr-backend api (default: 1)")
+    ap.add_argument("--ocr-max-side", type=int, default=None,
+                    help="downscale photos to this many pixels on the longest "
+                         "side before sending to the API; smaller is faster "
+                         "and avoids gateway timeouts (default: vlm_to_md.py's "
+                         "3000; try 1280 if you see HTTP 504)")
     ap.add_argument("--skip-existing", action="store_true",
                     help="reuse OCR and table files that already exist")
     ap.add_argument("--claude", default=None, help="path to the claude CLI")
@@ -114,17 +142,43 @@ def main():
     print(f"input   : {p['images']}")
     print(f"output  : {p['root']}")
     print(f"model   : {args.model}")
+    if args.ocr_backend == "api":
+        print(f"ocr     : api ({args.provider or 'provider from .env/default'}"
+              f" / {args.ocr_model or 'preset model'})")
+        if args.raw or args.mode != "gundam":
+            print("note: --raw/--mode only apply to the local backend; ignored")
+    else:
+        print("ocr     : local (ocr_to_md.py)")
 
     python = sys.executable
     times = {}
 
-    ocr = ["--image_dir", p["images"], "--output_dir", p["text"],
-           "--mode", args.mode, "--timeout", str(args.ocr_timeout)]
-    if not args.raw:
-        ocr.append("--clean")
-    if args.skip_existing:
-        ocr.append("--skip-existing")
-    times["1 OCR"] = run("STEP 1/4  images -> text", "ocr_to_md.py", ocr, python)
+    if args.ocr_backend == "api":
+        ocr = ["--image_dir", p["images"], "--output_dir", p["text"],
+               "--timeout", str(args.ocr_timeout),
+               "--concurrency", str(args.ocr_concurrency)]
+        if args.provider:
+            ocr += ["--provider", args.provider]
+        if args.base_url:
+            ocr += ["--base-url", args.base_url]
+        if args.ocr_model:
+            ocr += ["--model", args.ocr_model]
+        if args.api_key_env:
+            ocr += ["--api-key-env", args.api_key_env]
+        if args.ocr_max_side is not None:
+            ocr += ["--max-side", str(args.ocr_max_side)]
+        if args.skip_existing:
+            ocr.append("--skip-existing")
+        ocr_script = "vlm_to_md.py"
+    else:
+        ocr = ["--image_dir", p["images"], "--output_dir", p["text"],
+               "--mode", args.mode, "--timeout", str(args.ocr_timeout)]
+        if not args.raw:
+            ocr.append("--clean")
+        if args.skip_existing:
+            ocr.append("--skip-existing")
+        ocr_script = "ocr_to_md.py"
+    times["1 OCR"] = run("STEP 1/4  images -> text", ocr_script, ocr, python)
 
     tbl = ["--md_dir", p["text"], "--image_dir", p["images"],
            "--output_dir", p["table"], "--model", args.model]

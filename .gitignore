@@ -30,6 +30,9 @@ outputs/
 log/
 *.log
 
+# API keys and endpoint config (template: .env.example)
+.env
+
 # OS and editor files
 .DS_Store
 Thumbs.db
@@ -43,6 +46,9 @@ Equipment_Photos/
 Example_folder/
 Mechanical_input/
 test/
+Test/
+Test.zip
+normal_test/
 
 # Pipeline outputs -- run_pipeline.py writes Output_<input folder name>/
 Output_*/

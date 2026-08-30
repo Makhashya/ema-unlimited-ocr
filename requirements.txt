@@ -11,3 +11,6 @@ pymupdf==1.27.2.2
 psutil==7.2.2
 accelerate
 huggingface_hub[hf_transfer]
+# API OCR backend (vlm_to_md.py) needs only requests + Pillow --
+# torch/transformers/torchvision are NOT required for it.
+requests==2.32.5

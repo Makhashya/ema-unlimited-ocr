@@ -1,0 +1,10 @@
+# Everything the API-backend pipeline needs (no GPU / torch stack):
+#   run_pipeline.py --ocr-backend api
+#     vlm_to_md.py      -> requests, Pillow
+#     md_to_table.py    -> stdlib only (shells out to the claude CLI)
+#     tables_to_csv.py  -> stdlib only
+#     csv_to_excel.py   -> openpyxl
+# For the local GPU OCR backend use requirements.txt instead (plus torch).
+requests==2.32.5
+Pillow==12.1.1
+openpyxl==3.1.5
