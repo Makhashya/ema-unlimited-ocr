@@ -24,10 +24,14 @@ import streamlit as st
 import extract_core as core
 import job_store as js
 from equipment_pipeline_api import PROVIDERS, load_env_file
+from web_common import cli_available, load_streamlit_secrets, require_password
 
 st.set_page_config(page_title="EMA Equipment Extractor", page_icon="🔧",
                    layout="wide")
 load_env_file()
+load_streamlit_secrets()
+require_password()
+CLI_AVAILABLE = cli_available()
 
 STATE_BADGE = {
     "queued": ("⏳ Queued", "secondary"),
@@ -65,11 +69,15 @@ with st.sidebar:
              "answers straight in the schedule fields (about 3x faster).")
     direct = mode == "Direct fields"
     settings["mode"] = "direct" if direct else "pipeline"
-    backend = st.radio(
-        "Backend", ["API key", "Claude CLI"],
-        help="API key: OpenAI-compatible endpoint configured via .env / the "
-             "fields below. Claude CLI: the locally installed, already-"
-             "authenticated `claude` command -- no API key needed.")
+    if CLI_AVAILABLE:
+        backend = st.radio(
+            "Backend", ["API key", "Claude CLI"],
+            help="API key: OpenAI-compatible endpoint configured via .env / "
+                 "the fields below. Claude CLI: the locally installed, "
+                 "already-authenticated `claude` command -- no API key "
+                 "needed.")
+    else:
+        backend = "API key"
     use_cli = backend == "Claude CLI"
     settings["backend"] = "cli" if use_cli else "api"
     if use_cli:

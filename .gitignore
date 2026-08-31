@@ -68,3 +68,6 @@ jobs/
 
 # Local Streamlit secrets (template: .streamlit/secrets.toml.example)
 .streamlit/secrets.toml
+
+# Written by serve_public.py while a tunnel is up
+public_url.txt

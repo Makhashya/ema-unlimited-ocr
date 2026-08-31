@@ -23,7 +23,6 @@ Run it with:
     streamlit run app.py
 """
 
-import hmac
 import io
 import os
 import shutil
@@ -39,6 +38,7 @@ import streamlit as st
 import equipment_pipeline as cli_pipe
 import image_to_excel_api as direct_api
 import image_to_excel_cli as direct_cli
+from web_common import cli_available, load_streamlit_secrets, require_password
 from equipment_pipeline_api import (
     COLUMNS, EXTS, PROVIDERS, ApiError, PhotoTimeout,
     build_excel_workbook, dedupe_records, load_env_file,
@@ -51,55 +51,9 @@ st.set_page_config(page_title="EMA Equipment Extractor", page_icon="🔧",
 load_env_file()
 
 
-def load_streamlit_secrets():
-    """Hosted deployments keep keys in st.secrets, not .env.
-
-    Streamlit Community Cloud (and a local .streamlit/secrets.toml) expose
-    settings through st.secrets; copy the string entries into the
-    environment so the pipelines' .env-style lookups (OPENAI_API_KEY,
-    VLM_PROVIDER, ...) work unchanged. Real environment variables win.
-    """
-    try:
-        items = list(st.secrets.items())
-    except Exception:                       # no secrets file: local use
-        return
-    for key, value in items:
-        if isinstance(value, str) and value:
-            os.environ.setdefault(key, value)
-
-
 load_streamlit_secrets()
-
-
-def require_password():
-    """Gate the page behind APP_PASSWORD when it is set.
-
-    Without APP_PASSWORD (environment or secrets) the app is open, which is
-    fine on a private machine; set it before exposing the app publicly.
-    """
-    expected = os.environ.get("APP_PASSWORD", "")
-    if not expected or st.session_state.get("authed"):
-        return
-    st.title("🔧 Equipment List Extractor")
-    with st.form("login"):
-        password = st.text_input("Password", type="password")
-        if st.form_submit_button("Sign in", type="primary"):
-            if hmac.compare_digest(password, expected):
-                st.session_state["authed"] = True
-                st.rerun()
-            st.error("Wrong password.")
-    st.stop()
-
-
 require_password()
-
-# The Claude CLI backend only makes sense where `claude` is installed and
-# signed in (a developer machine); hosted deployments get the API backend.
-try:
-    cli_pipe.find_claude(None)
-    CLI_AVAILABLE = True
-except SystemExit:
-    CLI_AVAILABLE = False
+CLI_AVAILABLE = cli_available()
 
 # The full transcribe -> tabulate -> verify pipeline is switched off in the
 # web UI; every photo goes through the direct-fields extractor instead.

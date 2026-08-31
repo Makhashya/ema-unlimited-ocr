@@ -1,5 +1,36 @@
 # Hosting the web app
 
+Two ways to get a public URL:
+
+| | A. Streamlit Community Cloud | B. This PC + Cloudflare tunnel |
+|---|---|---|
+| Claude CLI backend | no (API key only) | yes |
+| Persistent jobs (`app_jobs.py`) | no | yes |
+| Online when | always | while the PC and `run_server.bat` are running |
+| URL | fixed | changes each start (fixed with a named tunnel) |
+
+## B. Serve from this PC (Claude CLI works)
+
+1. Make sure `.env` has `APP_PASSWORD=...` (the launcher refuses to expose
+   the app without one).
+2. Double-click **`run_server.bat`** (or `python serve_public.py`). It starts
+   Streamlit for `app_jobs.py` on a local port and a Cloudflare quick
+   tunnel, then prints
+   `PUBLIC URL: https://<random-words>.trycloudflare.com`
+   (also saved to `public_url.txt`). `run_server.bat app.py` serves the
+   single-session app instead.
+3. Share the URL and the password. Keep the window open; Ctrl+C (or closing
+   it) stops the server. The URL is new on every start.
+4. Fixed URL (optional): create a free Cloudflare account, add a domain,
+   then `cloudflared tunnel login`, `cloudflared tunnel create ema`,
+   `cloudflared tunnel route dns ema ema.yourdomain.com` and run
+   `cloudflared tunnel run --url http://127.0.0.1:8501 ema` instead of the
+   quick tunnel.
+
+`cloudflared` install if missing: `winget install Cloudflare.cloudflared`.
+
+## A. Streamlit Community Cloud
+
 `app.py` runs on **Streamlit Community Cloud** (free, HTTPS, deploys from
 this GitHub repo). Only the API backend is available when hosted; the
 Claude CLI backend is hidden automatically because `claude` is not
