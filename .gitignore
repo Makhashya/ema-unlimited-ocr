@@ -62,3 +62,6 @@ result.md
 
 # Test input folder (client photos + generated xlsx -- never commit)
 Test_image_to_excel/
+
+# Persistent job store of app_jobs.py (photos, results, worker log)
+jobs/

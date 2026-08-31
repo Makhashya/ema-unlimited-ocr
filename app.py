@@ -4,24 +4,19 @@ Accepts a single image, multiple images, or ZIP archive(s) containing images
 -- everything is flattened into one photo list and extracted into one merged
 equipment table with a per-photo progress bar and CSV download.
 
-A thin front end over the two batch pipelines -- the prompts, plumbing, and
-verification logic are imported from them, so the web app and the pipelines
-always behave identically. Nothing in the pipelines themselves is touched.
-
-Two modes, chosen in the sidebar:
-
-  Full pipeline   transcribe -> tabulate -> verify (three model calls per
-                  photo, the most accurate); equipment_pipeline[_api].py
-  Direct fields   one model call per photo that answers straight in the
-                  schedule fields (fast, cheap); image_to_excel_{api,cli}.py
+A thin front end over the direct-fields extractors (image_to_excel_api.py /
+image_to_excel_cli.py): one model call per photo that answers straight in
+the schedule fields. The prompts and plumbing are imported from them, so the
+web app and the scripts always behave identically. The three-stage
+transcribe -> tabulate -> verify pipeline is no longer offered here (the
+run_photo() path below is kept but disabled; DIRECT_ONLY = True).
 
 Two backends, chosen in the sidebar:
 
   API key      equipment_pipeline_api.py -- OpenAI-compatible endpoint,
                keys/defaults from .env (template: .env.example)
   Claude CLI   equipment_pipeline.py -- the locally installed, already-
-               authenticated `claude` command; no API key needed, and the
-               verify pass may use web search
+               authenticated `claude` command; no API key needed
 
 Run it with:
 
@@ -53,6 +48,10 @@ st.set_page_config(page_title="EMA Equipment Extractor", page_icon="🔧",
                    layout="wide")
 
 load_env_file()
+
+# The full transcribe -> tabulate -> verify pipeline is switched off in the
+# web UI; every photo goes through the direct-fields extractor instead.
+DIRECT_ONLY = True
 
 
 # --------------------------------------------------------------------------
@@ -224,23 +223,26 @@ def run_photo(runner, image_path, name, do_verify, stage_cb=None):
 
 with st.sidebar:
     st.header("Settings")
-    mode = st.radio(
-        "Mode",
-        ["Full pipeline", "Direct fields"],
-        help="Full pipeline: transcribe the plate, build the table, then "
-             "re-check it against the photo (three model calls per photo, "
-             "most accurate). Direct fields: one model call per photo that "
-             "answers straight in the schedule fields (fast and cheap; "
-             "image_to_excel_api.py / image_to_excel_cli.py).")
-    direct = mode == "Direct fields"
+    if DIRECT_ONLY:
+        direct = True
+        st.caption("Mode: direct fields -- one model call per photo, "
+                   "straight into the schedule columns.")
+    else:
+        mode = st.radio(
+            "Mode",
+            ["Full pipeline", "Direct fields"],
+            help="Full pipeline: transcribe the plate, build the table, "
+                 "then re-check it against the photo (three model calls "
+                 "per photo, most accurate). Direct fields: one model call "
+                 "per photo that answers straight in the schedule fields.")
+        direct = mode == "Direct fields"
     backend = st.radio(
         "Backend",
         ["API key", "Claude CLI"],
         help="API key: OpenAI-compatible endpoint configured via .env / the "
              "fields below (equipment_pipeline_api.py). Claude CLI: the "
              "locally installed, already-authenticated `claude` command "
-             "(equipment_pipeline.py) -- no API key needed, and the verify "
-             "pass may use web search.")
+             "(equipment_pipeline.py) -- no API key needed.")
     use_cli = backend == "Claude CLI"
     if use_cli:
         cli_model = st.text_input("Claude model", value="claude-opus-5")
