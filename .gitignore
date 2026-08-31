@@ -65,3 +65,6 @@ Test_image_to_excel/
 
 # Persistent job store of app_jobs.py (photos, results, worker log)
 jobs/
+
+# Local Streamlit secrets (template: .streamlit/secrets.toml.example)
+.streamlit/secrets.toml

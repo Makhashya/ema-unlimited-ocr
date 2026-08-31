@@ -23,6 +23,7 @@ Run it with:
     streamlit run app.py
 """
 
+import hmac
 import io
 import os
 import shutil
@@ -48,6 +49,57 @@ st.set_page_config(page_title="EMA Equipment Extractor", page_icon="🔧",
                    layout="wide")
 
 load_env_file()
+
+
+def load_streamlit_secrets():
+    """Hosted deployments keep keys in st.secrets, not .env.
+
+    Streamlit Community Cloud (and a local .streamlit/secrets.toml) expose
+    settings through st.secrets; copy the string entries into the
+    environment so the pipelines' .env-style lookups (OPENAI_API_KEY,
+    VLM_PROVIDER, ...) work unchanged. Real environment variables win.
+    """
+    try:
+        items = list(st.secrets.items())
+    except Exception:                       # no secrets file: local use
+        return
+    for key, value in items:
+        if isinstance(value, str) and value:
+            os.environ.setdefault(key, value)
+
+
+load_streamlit_secrets()
+
+
+def require_password():
+    """Gate the page behind APP_PASSWORD when it is set.
+
+    Without APP_PASSWORD (environment or secrets) the app is open, which is
+    fine on a private machine; set it before exposing the app publicly.
+    """
+    expected = os.environ.get("APP_PASSWORD", "")
+    if not expected or st.session_state.get("authed"):
+        return
+    st.title("🔧 Equipment List Extractor")
+    with st.form("login"):
+        password = st.text_input("Password", type="password")
+        if st.form_submit_button("Sign in", type="primary"):
+            if hmac.compare_digest(password, expected):
+                st.session_state["authed"] = True
+                st.rerun()
+            st.error("Wrong password.")
+    st.stop()
+
+
+require_password()
+
+# The Claude CLI backend only makes sense where `claude` is installed and
+# signed in (a developer machine); hosted deployments get the API backend.
+try:
+    cli_pipe.find_claude(None)
+    CLI_AVAILABLE = True
+except SystemExit:
+    CLI_AVAILABLE = False
 
 # The full transcribe -> tabulate -> verify pipeline is switched off in the
 # web UI; every photo goes through the direct-fields extractor instead.
@@ -236,13 +288,17 @@ with st.sidebar:
                  "per photo, most accurate). Direct fields: one model call "
                  "per photo that answers straight in the schedule fields.")
         direct = mode == "Direct fields"
-    backend = st.radio(
-        "Backend",
-        ["API key", "Claude CLI"],
-        help="API key: OpenAI-compatible endpoint configured via .env / the "
-             "fields below (equipment_pipeline_api.py). Claude CLI: the "
-             "locally installed, already-authenticated `claude` command "
-             "(equipment_pipeline.py) -- no API key needed.")
+    if CLI_AVAILABLE:
+        backend = st.radio(
+            "Backend",
+            ["API key", "Claude CLI"],
+            help="API key: OpenAI-compatible endpoint configured via .env / "
+                 "secrets / the fields below (equipment_pipeline_api.py). "
+                 "Claude CLI: the locally installed, already-authenticated "
+                 "`claude` command (equipment_pipeline.py) -- no API key "
+                 "needed.")
+    else:
+        backend = "API key"
     use_cli = backend == "Claude CLI"
     if use_cli:
         cli_model = st.text_input("Claude model", value="claude-opus-5")
@@ -358,9 +414,9 @@ def set_photo_deadline(runner):
 
 st.title("🔧 Equipment List Extractor")
 st.caption("Upload one photo, many photos, or a ZIP of a whole folder of "
-           "equipment nameplates (HVAC and similar). Each photo is "
-           "transcribed, turned into an equipment-schedule row, and "
-           "re-checked against the image; everything lands in one table.")
+           "equipment nameplates (HVAC and similar). Each photo is read "
+           "straight into an equipment-schedule row; everything lands in "
+           "one table with Excel and CSV downloads.")
 
 # The uploader can't be cleared programmatically, so "New upload" swaps its
 # widget key: the fresh key mounts an empty uploader and drops the old files.

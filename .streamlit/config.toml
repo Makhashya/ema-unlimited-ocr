@@ -1,0 +1,6 @@
+[server]
+# ZIPs of a whole site's nameplate photos can be large
+maxUploadSize = 500
+
+[browser]
+gatherUsageStats = false
