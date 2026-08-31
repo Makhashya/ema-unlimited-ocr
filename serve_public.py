@@ -1,7 +1,7 @@
 r"""Serve a web UI from this PC on a public HTTPS URL.
 
-    python serve_public.py              # app_jobs.py (persistent jobs)
-    python serve_public.py app.py       # the single-session app
+    python serve_public.py              # app.py
+    python serve_public.py app_jobs.py  # the persistent-jobs app
     run_server.bat [app]                # same, double-clickable
 
 Starts Streamlit on a local port (bound to 127.0.0.1 only) and a Cloudflare
@@ -76,8 +76,8 @@ def pump(stream, on_line):
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("app", nargs="?", default="app_jobs.py",
-                    help="Streamlit script to serve (default: app_jobs.py)")
+    ap.add_argument("app", nargs="?", default="app.py",
+                    help="Streamlit script to serve (default: app.py)")
     ap.add_argument("--port", type=int, default=8501,
                     help="local port to try first (default: 8501; the next "
                          "free one is used if it is busy)")

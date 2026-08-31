@@ -14,11 +14,11 @@ Two ways to get a public URL:
 1. Make sure `.env` has `APP_PASSWORD=...` (the launcher refuses to expose
    the app without one).
 2. Double-click **`run_server.bat`** (or `python serve_public.py`). It starts
-   Streamlit for `app_jobs.py` on a local port and a Cloudflare quick
+   Streamlit for `app.py` on a local port and a Cloudflare quick
    tunnel, then prints
    `PUBLIC URL: https://<random-words>.trycloudflare.com`
-   (also saved to `public_url.txt`). `run_server.bat app.py` serves the
-   single-session app instead.
+   (also saved to `public_url.txt`). `run_server.bat app_jobs.py` serves
+   the persistent-jobs app instead.
 3. Share the URL and the password. Keep the window open; Ctrl+C (or closing
    it) stops the server. The URL is new on every start.
 4. Fixed URL (optional): create a free Cloudflare account, add a domain,
