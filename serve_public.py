@@ -4,16 +4,23 @@ r"""Serve a web UI from this PC on a public HTTPS URL.
     python serve_public.py app_jobs.py  # the persistent-jobs app
     run_server.bat [app]                # same, double-clickable
 
-Starts Streamlit on a local port (bound to 127.0.0.1 only) and a Cloudflare
-quick tunnel to it, prints the public https://....trycloudflare.com URL
-(also written to public_url.txt), and stops both on Ctrl+C. Everything runs
-on this machine, so every backend installed here works -- including the
-Claude CLI. The URL changes each start; a fixed one needs a named Cloudflare
-tunnel (see DEPLOY.md).
+Starts Streamlit on a local port (bound to 127.0.0.1 only) and a tunnel to
+it, prints the public URL (also written to public_url.txt), and stops both
+on Ctrl+C. Everything runs on this machine, so every backend installed here
+works -- including the Claude CLI.
 
-Needs: cloudflared (winget install Cloudflare.cloudflared) and APP_PASSWORD
-in .env, so the URL is not open to everyone. Pass --open to skip the
-password check deliberately.
+Tunnel providers (picked automatically):
+  ngrok       when NGROK_DOMAIN is set in .env (or --ngrok-domain): a FIXED
+              URL such as https://ema-ocr.ngrok-free.app. Free ngrok account,
+              `ngrok config add-authtoken ...` once, and a static domain
+              claimed in the ngrok dashboard. Needs ngrok installed
+              (winget install ngrok.ngrok).
+  cloudflare  otherwise: an anonymous quick tunnel with a random
+              https://....trycloudflare.com URL that changes each start.
+              Needs cloudflared (winget install Cloudflare.cloudflared).
+
+Needs APP_PASSWORD in .env so the URL is not open to everyone; pass --open
+to skip that check deliberately.
 """
 
 import argparse
@@ -30,19 +37,30 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, ROOT)
 from equipment_pipeline_api import load_env_file       # noqa: E402
 
-URL_RE = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com")
-CLOUDFLARED_CANDIDATES = [
-    r"C:\Program Files (x86)\cloudflared\cloudflared.exe",
-    r"C:\Program Files\cloudflared\cloudflared.exe",
-]
+URL_RE = re.compile(r"https://[A-Za-z0-9.-]+\.(?:trycloudflare\.com|"
+                    r"ngrok-free\.app|ngrok-free\.dev|ngrok\.app|ngrok\.io|"
+                    r"ngrok\.dev)")
+TOOL_CANDIDATES = {
+    "cloudflared": [
+        r"C:\Program Files (x86)\cloudflared\cloudflared.exe",
+        r"C:\Program Files\cloudflared\cloudflared.exe",
+    ],
+    "ngrok": [
+        os.path.join(os.environ.get("LOCALAPPDATA", ""), "Microsoft",
+                     "WinGet", "Links", "ngrok.exe"),
+        os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "ngrok",
+                     "ngrok.exe"),
+        r"C:\ngrok\ngrok.exe",
+    ],
+}
 
 
-def find_cloudflared():
-    found = shutil.which("cloudflared")
+def find_tool(name: str):
+    found = shutil.which(name)
     if found:
         return found
-    for cand in CLOUDFLARED_CANDIDATES:
-        if os.path.isfile(cand):
+    for cand in TOOL_CANDIDATES.get(name, []):
+        if cand and os.path.isfile(cand):
             return cand
     return None
 
@@ -83,17 +101,33 @@ def main() -> int:
                          "free one is used if it is busy)")
     ap.add_argument("--open", action="store_true",
                     help="allow serving without APP_PASSWORD (public!)")
+    ap.add_argument("--ngrok-domain", default=None,
+                    help="fixed ngrok domain, e.g. ema-ocr.ngrok-free.app "
+                         "(default: NGROK_DOMAIN from .env; blank = "
+                         "Cloudflare quick tunnel with a random URL)")
     args = ap.parse_args()
 
     app = os.path.join(ROOT, args.app)
     if not os.path.isfile(app):
         sys.exit(f"app not found: {app}")
-    cf = find_cloudflared()
-    if not cf:
-        sys.exit("cloudflared not found. Install it with:\n"
-                 "    winget install Cloudflare.cloudflared\n"
-                 "then open a new terminal and run this again.")
     load_env_file()
+    domain = (args.ngrok_domain or os.environ.get("NGROK_DOMAIN", "")).strip()
+    domain = re.sub(r"^https?://", "", domain).strip("/")
+    if domain:
+        tool = find_tool("ngrok")
+        if not tool:
+            sys.exit("ngrok not found. Install it with:\n"
+                     "    winget install ngrok.ngrok\n"
+                     "then open a new terminal, run\n"
+                     "    ngrok config add-authtoken <token from "
+                     "dashboard.ngrok.com>\n"
+                     "and run this again.")
+    else:
+        tool = find_tool("cloudflared")
+        if not tool:
+            sys.exit("cloudflared not found. Install it with:\n"
+                     "    winget install Cloudflare.cloudflared\n"
+                     "then open a new terminal and run this again.")
     if not os.environ.get("APP_PASSWORD") and not args.open:
         sys.exit("APP_PASSWORD is not set in .env -- the public URL would be "
                  "open to anyone. Add a line  APP_PASSWORD=...  to .env "
@@ -111,10 +145,16 @@ def main() -> int:
          "--server.headless", "true", "--browser.gatherUsageStats", "false"],
         cwd=ROOT)
 
-    print("starting Cloudflare tunnel ...", flush=True)
+    if domain:
+        print(f"starting ngrok tunnel for https://{domain} ...", flush=True)
+        cmd = [tool, "http", f"--url={domain}", str(port),
+               "--log", "stdout", "--log-format", "logfmt"]
+    else:
+        print("starting Cloudflare quick tunnel (random URL) ...", flush=True)
+        cmd = [tool, "tunnel", "--url", f"http://127.0.0.1:{port}",
+               "--no-autoupdate"]
     tunnel = subprocess.Popen(
-        [cf, "tunnel", "--url", f"http://127.0.0.1:{port}", "--no-autoupdate"],
-        cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        cmd, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         text=True, encoding="utf-8", errors="replace")
 
     url_file = os.path.join(ROOT, "public_url.txt")
@@ -132,8 +172,9 @@ def main() -> int:
             print(f"  (also saved to {url_file})")
             print("  Keep this window open. Ctrl+C stops the server.")
             print("=" * 64 + "\n")
-        elif "error" in line.lower() or "failed" in line.lower():
-            print("cloudflared:", line)
+        elif ("error" in line.lower() or "failed" in line.lower()
+              or "ERR_NGROK" in line):
+            print("tunnel:", line, flush=True)
 
     threading.Thread(target=pump, args=(tunnel.stdout, on_line),
                      daemon=True).start()
@@ -144,11 +185,12 @@ def main() -> int:
                 print(f"Streamlit exited with code {web.returncode}")
                 break
             if tunnel.poll() is not None:
-                print(f"cloudflared exited with code {tunnel.returncode}")
+                print(f"tunnel exited with code {tunnel.returncode}")
                 break
             if not state["url"] and time.time() - start > 40:
                 print("no public URL after 40 s -- check your internet "
-                      "connection; still waiting ...")
+                      "connection (ngrok: authtoken and domain); still "
+                      "waiting ...", flush=True)
                 start = time.time()
             time.sleep(1)
     except KeyboardInterrupt:

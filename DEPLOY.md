@@ -21,11 +21,22 @@ Two ways to get a public URL:
    the persistent-jobs app instead.
 3. Share the URL and the password. Keep the window open; Ctrl+C (or closing
    it) stops the server. The URL is new on every start.
-4. Fixed URL (optional): create a free Cloudflare account, add a domain,
-   then `cloudflared tunnel login`, `cloudflared tunnel create ema`,
+4. **Fixed URL, free, no domain needed (ngrok)** -- one-time setup:
+   1. `winget install ngrok.ngrok`, then open a new terminal.
+   2. Create a free account at <https://dashboard.ngrok.com>.
+   3. Dashboard -> *Your Authtoken* -> copy, then run
+      `ngrok config add-authtoken <token>` (stores it in your user profile).
+   4. Dashboard -> *Domains* -> *New Domain* -> claim the free static domain
+      (e.g. `ema-ocr.ngrok-free.app`; the free plan gives one).
+   5. Put `NGROK_DOMAIN=ema-ocr.ngrok-free.app` in `.env`.
+   From then on `run_server.bat` uses ngrok and the URL is always
+   `https://ema-ocr.ngrok-free.app`. Visitors on the free plan see a
+   one-click "Visit Site" page the first time.
+5. Fixed URL with your own domain (Cloudflare named tunnel, also free):
+   add the domain to a Cloudflare account, then `cloudflared tunnel login`,
+   `cloudflared tunnel create ema`,
    `cloudflared tunnel route dns ema ema.yourdomain.com` and run
-   `cloudflared tunnel run --url http://127.0.0.1:8501 ema` instead of the
-   quick tunnel.
+   `cloudflared tunnel run --url http://127.0.0.1:8501 ema`.
 
 `cloudflared` install if missing: `winget install Cloudflare.cloudflared`.
 
