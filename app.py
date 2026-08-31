@@ -243,9 +243,10 @@ with st.sidebar:
                  "per photo that answers straight in the schedule fields.")
         direct = mode == "Direct fields"
     if CLI_AVAILABLE:
+        # Claude CLI first = the default whenever it is installed here
         backend = st.radio(
             "Backend",
-            ["API key", "Claude CLI"],
+            ["Claude CLI", "API key"],
             help="API key: OpenAI-compatible endpoint configured via .env / "
                  "secrets / the fields below (equipment_pipeline_api.py). "
                  "Claude CLI: the locally installed, already-authenticated "
