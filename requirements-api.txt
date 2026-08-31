@@ -8,3 +8,6 @@
 requests==2.32.5
 Pillow==12.1.1
 openpyxl==3.1.5
+# Web UI (app.py -- `streamlit run app.py`)
+streamlit==1.62.0
+pandas==3.0.5

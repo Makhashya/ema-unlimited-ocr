@@ -1,25 +1,21 @@
-r"""Single-file pipeline: equipment nameplate images -> markdown -> CSV.
+r"""Single-file pipeline: nameplate images -> markdown -> CSV, over an API.
 
-Everything runs through the already-authenticated `claude` CLI (Claude Code),
-so no API key is needed. For each image the CLI is called three times:
+API-key twin of equipment_pipeline.py: the same three stages, but every model
+call goes to a cloud (or local) vision-language model through an
+OpenAI-compatible chat-completions API instead of the `claude` CLI.
 
-  1. transcribe   the image is read by Claude's vision and every character of
-                  text on the nameplate is saved to  <stem>_text.md
+  1. transcribe   the image is sent to the VLM and every character of text on
+                  the nameplate is saved to  <stem>_text.md
   2. tabulate     the transcription is turned into one markdown equipment-
                   schedule table
-  3. verify       Claude re-opens the ORIGINAL image, checks every cell of the
-                  draft table against what is actually printed, corrects any
-                  mistakes, and fills in blanks it can genuinely read or
-                  derive; the verified table is saved to  <stem>_table.md
+  3. verify       the ORIGINAL image is sent again together with the draft
+                  table; the model re-checks every cell, fixes OCR errors,
+                  and fills blanks it can genuinely read or derive; the
+                  verified table is saved to  <stem>_table.md
                   (skip this pass with --no-verify)
 
-Finally all per-image tables are merged into one CSV with the columns:
-
-  Image | Tag # | Make | Model Number | Serial Number | Refrigerant Type |
-  Manufacture Date | Approximate Tonnage | MCA/MOCP | Voltage/Phase |
-  Condition  (G/M/P) | Comments
-
-Outputs land beside the input folder, matching the project layout:
+Finally all per-image tables are merged into one CSV. Outputs use the same
+folders as equipment_pipeline.py, so the two are interchangeable:
 
     Mechanical_input\                                (your images)
     Output_Mechanical_input\
@@ -27,24 +23,55 @@ Outputs land beside the input folder, matching the project layout:
         output_table_Mechanical_input\  *_table.md
         output_csv_Mechanical_input\    Mechanical_input.csv
 
+API setup is the same as vlm_to_md.py: keys live in environment variables or
+in a `.env` file beside this script (template: .env.example). Real
+environment variables win over .env values; command-line flags win over both.
+
+    openai     https://api.openai.com/v1                            OPENAI_API_KEY
+    anthropic  https://api.anthropic.com/v1  (OpenAI compat layer)  ANTHROPIC_API_KEY
+    gemini     https://generativelanguage.googleapis.com/v1beta/openai  GEMINI_API_KEY
+    custom     --base-url / VLM_BASE_URL (e.g. a local vLLM server)  API_KEY (optional)
+
 Usage:
-    python equipment_pipeline.py --image_dir Mechanical_input
-    python equipment_pipeline.py --image_dir Mechanical_input --model claude-sonnet-5
-    python equipment_pipeline.py --image_dir Mechanical_input --skip-existing
-    python equipment_pipeline.py --image_dir Mechanical_input --no-verify
-    python equipment_pipeline.py --image_dir Mechanical_input --limit 2   # smoke test
+    python equipment_pipeline_api.py --image_dir Mechanical_input --provider anthropic
+    python equipment_pipeline_api.py --image_dir Mechanical_input   (uses .env defaults)
+    python equipment_pipeline_api.py --image_dir Mechanical_input --no-verify
+    python equipment_pipeline_api.py --image_dir Mechanical_input --limit 2  # smoke test
+
+Note: unlike the CLI version, the verify pass here has no live web search --
+it re-reads the image and uses the model's own manufacturer knowledge only.
 """
 
 import argparse
+import base64
 import csv
 import os
 import re
-import shutil
-import subprocess
 import sys
 import time
 
+import requests
+
 EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
+
+# Formats every provider accepts as-is; anything else is re-encoded to JPEG.
+RAW_OK = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+          ".webp": "image/webp"}
+
+MAX_RAW_BYTES = 15 * 1024 * 1024   # stay under ~20 MB request limits
+
+PROVIDERS = {
+    # name: (base_url, key env var, default model)
+    "openai":    ("https://api.openai.com/v1", "OPENAI_API_KEY", "gpt-4o"),
+    "anthropic": ("https://api.anthropic.com/v1", "ANTHROPIC_API_KEY",
+                  "claude-opus-5"),
+    "gemini":    ("https://generativelanguage.googleapis.com/v1beta/openai",
+                  "GEMINI_API_KEY", "gemini-2.5-flash"),
+    "custom":    (None, "API_KEY", None),
+}
+
+MAX_RETRIES = 5
+RETRYABLE = {429, 500, 502, 503, 504, 529}
 
 COLUMNS = ("Tag #", "Make", "Model Number", "Serial Number", "Refrigerant Type",
            "Manufacture Date", "Approximate Tonnage", "MCA/MOCP",
@@ -52,8 +79,8 @@ COLUMNS = ("Tag #", "Make", "Model Number", "Serial Number", "Refrigerant Type",
 
 TRANSCRIBE_PROMPT = """\
 You are a meticulous transcription engine for equipment nameplate photos.
-Read the image file you are given and transcribe ALL text visible in it,
-exactly as printed.
+Read the attached image and transcribe ALL text visible in it, exactly as
+printed.
 
 Rules:
 - Preserve every character of model numbers, serial numbers, part numbers,
@@ -133,10 +160,9 @@ of a scenery photo)."""
 
 VERIFY_PROMPT = TABLE_PROMPT + """
 
-You are on a VERIFICATION pass. You are given the path to the original \
-nameplate photo, the raw transcription of it, and a draft table that was \
-built from that transcription. Use the Read tool to open the image and look \
-at the nameplate yourself, then:
+You are on a VERIFICATION pass. You are given the original nameplate photo \
+(attached to the message), the raw transcription of it, and a draft table \
+that was built from that transcription. Look at the photo yourself, then:
 
 - Check every filled cell of the draft against what is actually printed in \
 the image. Fix any cell the image contradicts -- especially model and serial \
@@ -148,27 +174,25 @@ the cell only when you can genuinely read the value in the image or derive \
 it under the rules above (year from the serial number, tonnage from the \
 model number). A cell whose value simply is not present must stay blank.
 - Give Manufacture Date special attention: if it is blank in the draft, \
-look for a date printed or stamped anywhere in the image, decode the serial \
-number's date scheme, and use your outside-information tools before \
-accepting a blank cell.
+look for a date printed or stamped anywhere in the image and decode the \
+serial number's date scheme before accepting a blank cell.
 - Do not drop or add rows unless the image clearly shows a different number \
 of physical units than the draft has rows.
 - Keep exactly the same columns, in the same order.
 
-You may also use OUTSIDE INFORMATION -- your own knowledge of manufacturers, \
-and the WebSearch/WebFetch tools -- to complete the verified plate data, \
-under strict conditions:
+You may also use OUTSIDE INFORMATION -- your own knowledge of manufacturers \
+-- to complete the verified plate data, under strict conditions:
 
 - Use it to decode what the plate already gives you: the manufacturer's \
 serial-number date scheme, the capacity/tonnage digits in the model number, \
 the refrigerant a specific model line shipped with, or the full company name \
 behind a logo or abbreviation on the plate.
 - Only accept an outside fact when it is specific to THIS make and exact \
-model/serial as read from the image, and the answer is unambiguous. If a \
-search returns conflicting schemes, a different model variant, or a "similar" \
-model, do not use it -- leave the cell as the plate supports.
-- Never copy ratings (MCA, MOCP, voltage, refrigerant) from a web listing \
-into a cell the plate itself contradicts; the plate always wins.
+model/serial as read from the image, and the answer is unambiguous. If your \
+knowledge is uncertain, covers a different model variant, or only a \
+"similar" model, do not use it -- leave the cell as the plate supports.
+- Never let remembered ratings (MCA, MOCP, voltage, refrigerant) override a \
+cell the plate itself supplies; the plate always wins.
 - Cells for values that are neither on the plate nor confidently derivable \
 stay blank.
 
@@ -179,53 +203,71 @@ FENCE_RE = re.compile(r"^\s*```[^\n]*\n(.*?)\n\s*```\s*$", re.DOTALL)
 SEP_CELL_RE = re.compile(r"^:?-{2,}:?$")
 CELL_SPLIT_RE = re.compile(r"(?<!\\)\|")   # pipes that are not backslash-escaped
 
-# Tools the CLI must never use in any stage. Read is allowed only when a
-# stage needs to open the image; WebSearch/WebFetch only in the verify stage.
-BLOCKED_TOOLS = ["Bash", "Write", "Edit", "NotebookEdit", "Glob", "Grep",
-                 "Task", "TodoWrite"]
-
 
 # --------------------------------------------------------------------------
-# claude CLI plumbing
+# environment / API plumbing (same policy as vlm_to_md.py)
 # --------------------------------------------------------------------------
 
-def find_claude(explicit: str = None) -> str:
-    """Locate the claude CLI.
+def load_env_file():
+    """Load KEY=VALUE lines from .env beside this script into os.environ.
 
-    A terminal opened before Claude Code was installed has a stale PATH, so
-    fall back to the usual install locations before giving up.
+    Values already set in the real environment are left alone, so exported
+    variables always win over the file.
     """
-    for cand in (explicit, os.environ.get("CLAUDE_CLI")):
-        if cand:
-            if os.path.isfile(cand):
-                return cand
-            found = shutil.which(cand)
-            if found:
-                return found
-            sys.exit(f"claude CLI not found at: {cand}")
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if not os.path.exists(path):
+        return
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key, value = key.strip(), value.strip().strip("'\"")
+            if key and value:
+                os.environ.setdefault(key, value)
 
-    found = shutil.which("claude")
-    if found:
-        return found
 
-    home = os.path.expanduser("~")
-    for cand in (
-        os.path.join(home, ".local", "bin", "claude.exe"),
-        os.path.join(home, ".local", "bin", "claude"),
-        os.path.join(os.environ.get("APPDATA", ""), "npm", "claude.cmd"),
-        os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "claude",
-                     "claude.exe"),
-    ):
-        if cand and os.path.isfile(cand):
-            return cand
+def image_to_data_uri(path: str, max_side: int) -> str:
+    """Base64 data URI for the image, re-encoding only when needed.
 
-    sys.exit(
-        "`claude` CLI not found on PATH.\n"
-        "  - If Claude Code is installed, open a NEW terminal (this one has a\n"
-        "    stale PATH) and try again.\n"
-        "  - Or point at it directly:  --claude \"C:\\path\\to\\claude.exe\"\n"
-        "  - Or set the CLAUDE_CLI environment variable."
-    )
+    Re-encode to JPEG when the format isn't universally accepted (bmp/tiff),
+    the longest side exceeds max_side, or the file is too big for one request.
+    """
+    ext = os.path.splitext(path)[1].lower()
+    mime = RAW_OK.get(ext)
+    needs_reencode = mime is None or os.path.getsize(path) > MAX_RAW_BYTES
+
+    if not needs_reencode and max_side > 0:
+        from PIL import Image
+        with Image.open(path) as im:
+            needs_reencode = max(im.size) > max_side
+
+    if needs_reencode:
+        import io
+        from PIL import Image
+        with Image.open(path) as im:
+            im = im.convert("RGB")
+            if max_side > 0 and max(im.size) > max_side:
+                scale = max_side / max(im.size)
+                im = im.resize((round(im.width * scale), round(im.height * scale)),
+                               Image.LANCZOS)
+            buf = io.BytesIO()
+            im.save(buf, format="JPEG", quality=92)
+        data, mime = buf.getvalue(), "image/jpeg"
+    else:
+        with open(path, "rb") as f:
+            data = f.read()
+
+    return f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"
+
+
+class ApiError(RuntimeError):
+    pass
+
+
+class PhotoTimeout(ApiError):
+    """The per-photo time budget (--photo-timeout) ran out mid-stage."""
 
 
 def strip_fence(text: str) -> str:
@@ -233,86 +275,90 @@ def strip_fence(text: str) -> str:
     return m.group(1).strip() if m else text.strip()
 
 
-def run_claude(claude: str, prompt: str, system_prompt: str, model: str,
-               timeout: int, read_dir: str = None, web: bool = False) -> str:
-    """One prompt -> one text response through `claude -p`.
+def chat(session, base_url, headers, model, system_prompt, user_content,
+         timeout, max_tokens, deadline=None) -> str:
+    """One chat-completions call, with retry/backoff on transient errors.
 
-    read_dir, when given, allows the Read tool (and grants access to that
-    directory) so Claude's vision can open the image file named in the prompt.
-    web additionally allows WebSearch/WebFetch, for the verify stage to look
-    up manufacturer serial/model schemes. Everything else stays disallowed.
+    user_content is either a plain string or a list of content parts
+    (text / image_url dicts) for vision requests. deadline, when given, is a
+    time.perf_counter() value past which the call raises PhotoTimeout instead
+    of starting (or retrying) a request.
     """
-    allowed, blocked = [], list(BLOCKED_TOOLS)
-    if read_dir:
-        allowed.append("Read")
-    else:
-        blocked.append("Read")
-    if web:
-        allowed += ["WebSearch", "WebFetch"]
-    else:
-        blocked += ["WebSearch", "WebFetch"]
-
-    cmd = [claude, "-p",
-           "--system-prompt", system_prompt,
-           "--model", model,
-           "--output-format", "text",
-           "--no-session-persistence"]
-    if read_dir:
-        cmd += ["--add-dir", read_dir]
-    if allowed:
-        cmd += ["--allowed-tools", *allowed]
-    cmd += ["--disallowed-tools", *blocked]
-    # Popen + explicit tree kill: subprocess.run(timeout=...) only kills the
-    # top process, and a .cmd shim or a helper child that keeps stdout open
-    # would make the timeout silently overrun until that child exits.
-    popen_kw = {}
-    if os.name != "nt":
-        popen_kw["start_new_session"] = True
-    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE, text=True,
-                            encoding="utf-8", errors="replace", **popen_kw)
-    try:
-        out, err = proc.communicate(prompt, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        kill_tree(proc)
-        raise
-    if proc.returncode != 0:
-        raise RuntimeError((err or out or "").strip()[:500])
-    return strip_fence(out)
-
-
-def kill_tree(proc) -> None:
-    """Terminate proc and every descendant, then reap it."""
-    if os.name == "nt":
-        subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                       capture_output=True)
-    else:
-        import signal
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ],
+        "temperature": 0,
+        "max_tokens": max_tokens,
+    }
+    last = None
+    for attempt in range(MAX_RETRIES):
+        eff_timeout = timeout
+        if deadline is not None:
+            budget = deadline - time.perf_counter()
+            if budget <= 1:
+                raise PhotoTimeout("photo time budget exceeded")
+            eff_timeout = min(timeout, budget)
         try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-    try:
-        proc.kill()
-    except OSError:
-        pass
-    try:
-        proc.communicate(timeout=5)
-    except (subprocess.TimeoutExpired, OSError, ValueError):
-        pass
+            resp = session.post(f"{base_url}/chat/completions", json=payload,
+                                headers=headers, timeout=eff_timeout)
+            if resp.status_code == 200:
+                choice = resp.json()["choices"][0]
+                content = (choice.get("message") or {}).get("content") or ""
+                if content.strip():
+                    return strip_fence(content)
+                finish = choice.get("finish_reason")
+                if finish != "length":
+                    # an empty answer that stopped normally IS the answer --
+                    # e.g. transcribing a photo with no readable text
+                    return ""
+                # A reasoning model can burn the whole token budget on its
+                # hidden reasoning_content and return an EMPTY answer with
+                # finish_reason "length". Retry with a larger budget so the
+                # visible answer fits after the thinking.
+                payload["max_tokens"] = min(payload["max_tokens"] * 4, 65536)
+                last = (f"model returned empty content (finish_reason=length);"
+                        f" retrying with max_tokens={payload['max_tokens']}")
+                wait = 2
+            else:
+                body = resp.text[:300]
+                if resp.status_code not in RETRYABLE:
+                    # wrong model, bad key, oversized request:
+                    # retrying won't help
+                    raise ApiError(f"HTTP {resp.status_code}: {body}")
+                last = f"HTTP {resp.status_code}: {body}"
+                wait = 3 * (attempt + 1)
+                if resp.status_code == 429 and resp.headers.get("Retry-After"):
+                    try:
+                        wait = min(float(resp.headers["Retry-After"]), 60.0)
+                    except ValueError:
+                        pass
+        except requests.RequestException as e:
+            last = f"{type(e).__name__}: {e}"
+            wait = 3 * (attempt + 1)
+        if attempt < MAX_RETRIES - 1:
+            if deadline is not None:
+                wait = min(wait, max(0.0, deadline - time.perf_counter()))
+            time.sleep(wait)
+    raise ApiError(f"gave up after {MAX_RETRIES} attempts: {last}")
 
 
 # --------------------------------------------------------------------------
 # stage 1: image -> transcription markdown
 # --------------------------------------------------------------------------
 
-def transcribe_image(claude: str, image_path: str, model: str,
-                     timeout: int) -> str:
-    image_path = os.path.abspath(image_path)
-    prompt = (f"Read the image file at {image_path} and transcribe all text "
-              f"in it, following your transcription rules.")
-    return run_claude(claude, prompt, TRANSCRIBE_PROMPT, model, timeout,
-                      read_dir=os.path.dirname(image_path))
+def transcribe_image(api, image_path: str, max_side: int) -> str:
+    uri = image_to_data_uri(image_path, max_side)
+    content = [
+        {"type": "image_url", "image_url": {"url": uri}},
+        {"type": "text", "text": "Transcribe all text in this image, "
+                                 "following your transcription rules."},
+    ]
+    return chat(api["session"], api["base_url"], api["headers"], api["model"],
+                TRANSCRIBE_PROMPT, content, api["timeout"], api["max_tokens"],
+                deadline=api.get("deadline"))
 
 
 # --------------------------------------------------------------------------
@@ -343,35 +389,63 @@ def add_image_column(table: str, image: str) -> str:
     return "\n".join(out)
 
 
-def extract_table(claude: str, transcription: str, model: str,
-                  timeout: int) -> str:
-    return run_claude(claude, transcription, TABLE_PROMPT, model, timeout)
+def normalize_table(table: str) -> str:
+    """Ensure the table starts with the canonical header and separator.
+
+    Some models (especially smaller local VLMs) return only the data row(s);
+    without a header the downstream parser would mistake the first data row
+    for one. Detected by the absence of the 'Tag #' header cell.
+    """
+    lines = [ln for ln in table.splitlines() if ln.strip().startswith("|")]
+    if not lines or any("Tag #" in ln for ln in lines):
+        return table
+    header = "| " + " | ".join(COLUMNS) + " |"
+    sep = "|" + "---|" * len(COLUMNS)
+    return "\n".join([header, sep, *lines])
+
+
+def extract_table(api, transcription: str) -> str:
+    table = normalize_table(
+        chat(api["session"], api["base_url"], api["headers"], api["model"],
+             TABLE_PROMPT, transcription, api["timeout"], api["max_tokens"],
+             deadline=api.get("deadline")))
+    if parse_table(table)[0] is None:
+        # a header-only table is a legitimate "no data" answer, but NO table
+        # at all means the model failed -- surface it instead of writing an
+        # empty file that silently drops the transcription's information
+        raise ApiError("the model returned no table for this transcription "
+                       "(transcription is saved; retry or raise --max-tokens)")
+    return table
 
 
 # --------------------------------------------------------------------------
 # stage 3: re-check the table against the original image
 # --------------------------------------------------------------------------
 
-def verify_table(claude: str, image_path: str, transcription: str,
-                 draft_table: str, model: str, timeout: int) -> str:
+def verify_table(api, image_path: str, transcription: str, draft_table: str,
+                 max_side: int) -> str:
     """Second look: correct and complete the draft table from the image.
 
     Falls back to the draft when the verifier returns something that no
     longer parses as a table, so a bad verification pass can never lose data.
     """
-    image_path = os.path.abspath(image_path)
-    prompt = (f"Original nameplate photo: {image_path}\n"
-              f"(open it with the Read tool)\n\n"
-              f"Raw transcription of the photo:\n\n{transcription}\n\n"
-              f"Draft table to verify and complete:\n\n{draft_table}")
-    checked = run_claude(claude, prompt, VERIFY_PROMPT, model, timeout,
-                         read_dir=os.path.dirname(image_path), web=True)
-    header, _ = parse_table(checked)
-    return checked if header else draft_table
+    uri = image_to_data_uri(image_path, max_side)
+    content = [
+        {"type": "image_url", "image_url": {"url": uri}},
+        {"type": "text", "text":
+            f"Raw transcription of the attached photo:\n\n{transcription}\n\n"
+            f"Draft table to verify and complete:\n\n{draft_table}"},
+    ]
+    checked = normalize_table(
+        chat(api["session"], api["base_url"], api["headers"], api["model"],
+             VERIFY_PROMPT, content, api["timeout"], api["max_tokens"],
+             deadline=api.get("deadline")))
+    header, rows = parse_table(checked)
+    return checked if header and rows else draft_table
 
 
 # --------------------------------------------------------------------------
-# stage 3: markdown tables -> one CSV
+# stage 4: markdown tables -> one CSV
 # --------------------------------------------------------------------------
 
 def split_row(line: str):
@@ -416,7 +490,7 @@ def tables_to_csv(table_dir: str, out_path: str, encoding: str = "utf-8-sig",
         if not header:
             print(f"  {name}: no table found, skipped")
             continue
-        for col in header:                 # tolerate extra columns from Claude
+        for col in header:                 # tolerate extra columns
             if col and col not in columns:
                 columns.append(col)
         if not rows:
@@ -589,19 +663,33 @@ def paths_for(image_dir: str):
 def main():
     ap = argparse.ArgumentParser(
         description="nameplate images -> markdown -> equipment-schedule CSV, "
-                    "all through the claude CLI")
+                    "over an OpenAI-compatible vision API (API-key twin of "
+                    "equipment_pipeline.py)")
     ap.add_argument("--image_dir", required=True, help="folder of input images")
-    ap.add_argument("--model", default="claude-opus-5",
-                    help="Claude model for both stages (default: claude-opus-5)")
-    ap.add_argument("--claude", default=None,
-                    help="path to the claude CLI if it is not on PATH")
-    ap.add_argument("--timeout", type=int, default=600,
-                    help="seconds per CLI call (default: 600)")
+    ap.add_argument("--provider", choices=sorted(PROVIDERS), default=None,
+                    help="which API preset to use "
+                         "(default: VLM_PROVIDER from .env, else openai)")
+    ap.add_argument("--base-url", default=None,
+                    help="override the API base URL (required for --provider custom)")
+    ap.add_argument("--model", default=None,
+                    help="model name (default: the provider's preset)")
+    ap.add_argument("--api-key-env", default=None,
+                    help="name of the env var holding the API key "
+                         "(default: the provider's usual variable)")
+    ap.add_argument("--timeout", type=float, default=300.0,
+                    help="per-attempt HTTP timeout in seconds (default: 300)")
     ap.add_argument("--photo-timeout", type=float, default=300.0,
                     help="total seconds allowed per photo across all stages; "
                          "on overrun the results extracted so far are saved "
                          "and the run moves to the next photo "
                          "(default: 300 = 5 min; 0 disables)")
+    ap.add_argument("--max-tokens", type=int, default=16384,
+                    help="response token cap per call (default: 16384; "
+                         "reasoning models spend part of this thinking, and "
+                         "an empty length-capped answer auto-retries larger)")
+    ap.add_argument("--max-side", type=int, default=3000,
+                    help="downscale images whose longest side exceeds this "
+                         "many pixels (default: 3000; 0 disables)")
     ap.add_argument("--no-verify", action="store_true",
                     help="skip the verification pass that re-checks each "
                          "table against the original image (faster, cheaper)")
@@ -613,7 +701,46 @@ def main():
 
     if not os.path.isdir(args.image_dir):
         sys.exit(f"not a folder: {args.image_dir}")
-    claude = find_claude(args.claude)
+
+    load_env_file()
+
+    provider = args.provider or os.environ.get("VLM_PROVIDER", "").lower() or "openai"
+    if provider not in PROVIDERS:
+        ap.error(f"VLM_PROVIDER in .env must be one of "
+                 f"{', '.join(sorted(PROVIDERS))} (got '{provider}')")
+
+    # The VLM_* endpoint settings in .env describe one endpoint together with
+    # VLM_PROVIDER, so they only apply when the provider wasn't chosen on the
+    # command line -- an explicit --provider uses that provider's presets.
+    def env_default(name):
+        return None if args.provider else os.environ.get(name)
+
+    preset_url, preset_env, preset_model = PROVIDERS[provider]
+    base_url = (args.base_url or env_default("VLM_BASE_URL")
+                or preset_url or "").rstrip("/")
+    if not base_url:
+        ap.error("--base-url (or VLM_BASE_URL in .env) is required "
+                 "with the custom provider")
+    model = args.model or env_default("VLM_MODEL") or preset_model
+    if not model:
+        ap.error("--model (or VLM_MODEL in .env) is required "
+                 "with the custom provider")
+
+    key_env = args.api_key_env or env_default("VLM_API_KEY_ENV") or preset_env
+    api_key = os.environ.get(key_env, "")
+    if not api_key and provider != "custom":
+        sys.exit(f"no API key: set {key_env} in the environment or in "
+                 f"{os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')} "
+                 f"(template: .env.example)")
+
+    api = {
+        "session": requests.Session(),
+        "base_url": base_url,
+        "headers": {"Authorization": f"Bearer {api_key}"} if api_key else {},
+        "model": model,
+        "timeout": args.timeout,
+        "max_tokens": args.max_tokens,
+    }
 
     images = sorted((f for f in os.listdir(args.image_dir)
                      if os.path.splitext(f)[1].lower() in EXTS),
@@ -628,7 +755,7 @@ def main():
     os.makedirs(p["table"], exist_ok=True)
     print(f"input : {p['images']}  ({len(images)} image(s))")
     print(f"output: {p['root']}")
-    print(f"model : {args.model}")
+    print(f"api   : {provider}  model: {model}  ({base_url})")
 
     t0 = time.perf_counter()
     failed = []
@@ -648,13 +775,9 @@ def main():
     timed_out, skipped = [], []
     for i, (name, text_path, table_path) in enumerate(jobs, 1):
         t = time.perf_counter()
-        deadline = (t + args.photo_timeout) if args.photo_timeout > 0 else None
-
-        def left():
-            """Seconds this photo may still spend, capped by --timeout."""
-            if deadline is None:
-                return args.timeout
-            return min(args.timeout, deadline - time.perf_counter())
+        image_path = os.path.join(p["images"], name)
+        api["deadline"] = (t + args.photo_timeout) if args.photo_timeout > 0 \
+            else None
 
         # -- stage 1: transcribe ---------------------------------------------
         try:
@@ -662,18 +785,16 @@ def main():
                 text = open(text_path, encoding="utf-8").read().strip()
                 note = "text reused"
             else:
-                text = transcribe_image(
-                    claude, os.path.join(p["images"], name),
-                    args.model, left()).strip()
+                text = transcribe_image(api, image_path, args.max_side).strip()
                 with open(text_path, "w", encoding="utf-8") as f:
                     f.write(text + "\n")
                 note = f"{len(text)} chars"
-        except subprocess.TimeoutExpired:
+        except PhotoTimeout:
             print(f"[{i}/{len(jobs)}] {name}  photo time budget exceeded "
                   f"during transcription -- nothing extracted, moving on")
             timed_out.append(name)
             continue
-        except (RuntimeError, OSError) as e:
+        except (ApiError, OSError) as e:
             print(f"[{i}/{len(jobs)}] {name}  FAILED: {e}")
             failed.append(name)
             continue
@@ -688,43 +809,36 @@ def main():
             if args.skip_existing and os.path.exists(table_path):
                 note += ", table reused"
             else:
-                if left() <= 1:
-                    raise subprocess.TimeoutExpired(cmd="claude", timeout=0)
-                table = extract_table(claude, text, args.model, left())
+                table = extract_table(api, text)
 
                 # -- stage 3: re-check against the original image ------------
                 _, draft_rows = parse_table(table)
                 if not args.no_verify and draft_rows:
-                    if left() <= 1:
-                        note += ", verify skipped (photo budget spent)"
+                    try:
+                        table = verify_table(api, image_path, text, table,
+                                             args.max_side)
+                        note += ", verified"
+                    except PhotoTimeout:
+                        # keep the unverified draft rather than lose it
+                        note += ", verify timed out (draft table kept)"
                         timed_out.append(name)
-                    else:
-                        try:
-                            table = verify_table(
-                                claude, os.path.join(p["images"], name),
-                                text, table, args.model, left())
-                            note += ", verified"
-                        except subprocess.TimeoutExpired:
-                            # keep the unverified draft rather than lose it
-                            note += ", verify timed out (draft table kept)"
-                            timed_out.append(name)
 
                 table = add_image_column(table, name)
                 with open(table_path, "w", encoding="utf-8") as f:
                     f.write(f"# {name}\n\n{table}\n")
-        except subprocess.TimeoutExpired:
+        except PhotoTimeout:
             print(f"[{i}/{len(jobs)}] {name}  photo time budget exceeded -- "
                   f"transcription saved, table skipped, moving on")
             timed_out.append(name)
             continue
-        except (RuntimeError, OSError) as e:
+        except (ApiError, OSError) as e:
             print(f"[{i}/{len(jobs)}] {name}  FAILED: {e}")
             failed.append(name)
             continue
         print(f"[{i}/{len(jobs)}] {name}  {time.perf_counter()-t:.1f}s  "
               f"{note} -> {os.path.basename(table_path)}")
 
-    # -- stage 3: merge every table (including earlier runs) into the CSV
+    # -- stage 4+5: merge every table (including earlier runs) into the CSV
     # and the deduplicated Excel workbook --------------------------------
     print()
     tables_to_csv(p["table"], p["csv"], excel_path=p["excel"])
